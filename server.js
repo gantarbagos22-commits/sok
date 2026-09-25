@@ -266,12 +266,14 @@ function waitForJoin(sessionId, room, timeoutMs = 10000) {
 }
 
 function resolveJoin(sessionId, msg) {
-  if (String(msg?.type || "").toLowerCase() !== "room.join.result") return false;
+  const type = String(msg?.type || "").trim().toLowerCase();
+  const isJoinResult = type === "room.join.result";
+  if (!isJoinResult) return false;
 
   const list = joinWaiters.get(sessionId);
   if (!list?.length) return false;
 
-  const room = String(msg.data?.room ?? msg.room ?? "").trim();
+  const room = String(msg?.data?.room ?? msg?.room ?? "").trim();
   let index = room ? list.findIndex(x => x.room === room) : 0;
   if (index < 0) index = 0;
 
@@ -283,14 +285,23 @@ function resolveJoin(sessionId, msg) {
   if (list.length) joinWaiters.set(sessionId, list);
   else joinWaiters.delete(sessionId);
 
+  // The Developer API uses room.join.result for both successful and failed
+  // direct join commands. Treat explicit failure fields as failure instead of
+  // assuming that the absence of an error code means success.
   const apiErr = extractApiError(msg);
-  const status = String(msg.data?.status ?? msg.status ?? "").toLowerCase();
-  const success = !apiErr.code && !/^(error|failed|failure|denied|rejected)$/i.test(status);
+  const data = msg?.data || {};
+  const status = String(data?.status ?? msg?.status ?? "").trim().toLowerCase();
+  const successField = data?.success ?? msg?.success;
+  const failed = Boolean(apiErr.code) || successField === false ||
+    /^(error|failed|failure|denied|rejected|forbidden|unauthorized)$/i.test(status);
 
-  if (success) {
+  if (!failed) {
+    const account = sessions.get(sessionId);
+    if (account && room) account.joinedRoom = room;
     entry.resolve(msg);
   } else {
-    const err = new Error(apiErr.message || `Enter Room gagal${apiErr.code ? ` (${apiErr.code})` : ""}.`);
+    const message = apiErr.code || apiErr.message || `Enter Room gagal${status ? ` (${status})` : ""}.`;
+    const err = new Error(message);
     err.code = apiErr.code;
     err.event = msg;
     entry.reject(err);
@@ -614,17 +625,18 @@ app.post("/api/batch-action", async (req, res) => {
   if (action === "join") {
     if (!room) return res.status(400).json({ ok: false, error: "Room wajib diisi." });
 
-    // Register all waiters BEFORE sending anything, so a very fast API response
-    // can never arrive before its Promise is listening.
+    // Join is a direct WebSocket command. Dispatch to every selected socket
+    // immediately and independently; one slow/unresponsive socket must never
+    // block the other sockets from receiving room.join. We still register a
+    // waiter before each send so the direct room.join.result cannot be missed.
     const jobs = ids.map(async (sessionId) => {
-      let waiter = null;
       try {
-        waiter = waitForJoin(sessionId, room, 10000);
+        const waiter = waitForJoin(sessionId, room, 5000);
         send(sessionId, { type: "room.join", room });
         const event = await waiter;
-        return { sessionId, ok: true, event };
+        return { sessionId, ok: true, sent: true, event };
       } catch (e) {
-        return { sessionId, ok: false, error: safeError(e), event: e?.event || null };
+        return { sessionId, ok: false, sent: false, error: safeError(e), event: e?.event || null };
       }
     });
 
@@ -633,8 +645,8 @@ app.post("/api/batch-action", async (req, res) => {
     return res.json({
       ok: success > 0,
       action,
-      room,
-      sent: ids.length,
+      room: String(room).trim(),
+      sent: results.filter(x => x.sent).length,
       success,
       total: results.length,
       results
