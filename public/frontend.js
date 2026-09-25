@@ -867,7 +867,8 @@ async function joinAll(){
     const i = accounts.findIndex(a => a.sessionId === item.sessionId);
     if(i < 0) continue;
     if(item.ok){
-      accounts[i].joinedRoom = room;
+      const joinedRoom = String(item.event?.data?.room ?? item.event?.room ?? room).trim();
+      accounts[i].joinedRoom = joinedRoom || room;
     }
   }
 }
