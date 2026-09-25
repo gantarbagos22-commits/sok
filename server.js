@@ -22,14 +22,10 @@ const API_WS = "wss://developer.mig33.id/developer/ws";
 // One authenticated MigReborn account = one WebSocket, as required by the official API.
 // The UI can issue ONE batch command that dispatches concurrently to up to 10 sockets.
 const sessions = new Map();
+const usernameSessions = new Map();
 const subscribers = new Map();
 const kickExecutions = new Map();
 const kickProgressSubscribers = new Map();
-const balanceWaiters = new Map();
-const messageWaiters = new Map();
-const participantWaiters = new Map();
-const joinWaiters = new Map();
-const leaveWaiters = new Map();
 
 function makeId() { return crypto.randomBytes(16).toString("hex"); }
 function safeError(err) { return String(err?.message || err || "Unknown error"); }
@@ -66,56 +62,77 @@ function publish(sessionId, msg) {
   }
 }
 
+function clearPending(account, reason) {
+  if (!account?.pending) return;
+  for (const key of ["join", "leave", "participants", "balance", "message"]) {
+    const pending = account.pending[key];
+    if (!pending) continue;
+    if (pending.timer) clearTimeout(pending.timer);
+    try { pending.reject(new Error(reason)); } catch {}
+    account.pending[key] = null;
+  }
+}
+
 function closeSession(sessionId, reason = "logout") {
   const account = sessions.get(sessionId);
   if (!account) return false;
+  clearPending(account, `Session ditutup: ${reason}`);
   if (account.pingTimer) clearInterval(account.pingTimer);
-  try { if (account.socket.readyState === WebSocket.OPEN) account.socket.close(1000, reason); } catch {}
   sessions.delete(sessionId);
+  if (usernameSessions.get(String(account.username).toLowerCase()) === sessionId) usernameSessions.delete(String(account.username).toLowerCase());
   const set = subscribers.get(sessionId);
-  if (set) {
-    for (const res of set) { try { res.end(); } catch {} }
-    subscribers.delete(sessionId);
-  }
-  const bw = balanceWaiters.get(sessionId);
-  if (bw) { clearTimeout(bw.timer); bw.reject(new Error("Session ditutup sebelum saldo diterima.")); balanceWaiters.delete(sessionId); }
-
-  const pw = participantWaiters.get(sessionId);
-  if (pw) {
-    clearTimeout(pw.timer);
-    pw.reject(new Error("Session ditutup sebelum daftar user diterima."));
-    participantWaiters.delete(sessionId);
-  }
-
-  const jw = joinWaiters.get(sessionId);
-  if (jw) {
-    for (const entry of jw) {
-      clearTimeout(entry.timer);
-      entry.reject(new Error("Session ditutup sebelum hasil Enter Room diterima."));
-    }
-    joinWaiters.delete(sessionId);
-  }
-
-  const lw = leaveWaiters.get(sessionId);
-  if (lw) {
-    for (const entry of lw) {
-      clearTimeout(entry.timer);
-      entry.reject(new Error("Session ditutup sebelum hasil Leave Room diterima."));
-    }
-    leaveWaiters.delete(sessionId);
-  }
-
-  const mw = messageWaiters.get(sessionId);
-  if (mw) {
-    for (const entry of mw) {
-      clearTimeout(entry.timer);
-      entry.reject(new Error("Session ditutup sebelum respons pesan diterima."));
-    }
-    messageWaiters.delete(sessionId);
-  }
+  if (set) { for (const res of set) { try { res.end(); } catch {} } subscribers.delete(sessionId); }
+  try {
+    if (account.socket.readyState === WebSocket.OPEN || account.socket.readyState === WebSocket.CONNECTING) account.socket.close(1000, String(reason).slice(0,120));
+  } catch {}
   return true;
 }
 
+function getActiveSessionIds() { return [...sessions.keys()]; }
+function getSession(sessionId) {
+  const account = sessions.get(String(sessionId || ""));
+  if (!account) throw new Error("Session tidak ditemukan / sudah logout.");
+  if (account.socket.readyState !== WebSocket.OPEN) throw new Error("WebSocket tidak terhubung.");
+  return account;
+}
+function normalizeRoomName(value) { return String(value ?? "").trim().toLowerCase(); }
+function roomName(value) { return String(value ?? "").trim(); }
+function apiErrorFromMessage(msg) {
+  const data = msg?.data || {};
+  return {
+    code: String(data.code ?? data.error_code ?? data.error ?? msg?.code ?? msg?.error_code ?? "").trim(),
+    message: String(data.message ?? data.detail ?? data.error_message ?? msg?.message ?? msg?.error ?? "API error").trim()
+  };
+}
+function directResultOK(msg) {
+  if (String(msg?.type || "") === "error") return false;
+  const data = msg?.data || {};
+  const status = String(data.status ?? msg?.status ?? "").trim().toLowerCase();
+  const err = String(data.error ?? data.error_code ?? msg?.error ?? msg?.error_code ?? "").trim();
+  return !err && !["error", "failed", "failure", "denied", "rejected", "forbidden"].includes(status);
+}
+function waitForDirect(account, key, matcher, label, timeoutMs = 10000) {
+  if (account.pending[key]) throw new Error(`${label} sedang diproses.`);
+  return new Promise((resolve, reject) => {
+    const pending = { resolve, reject, matcher, timer: null };
+    pending.timer = setTimeout(() => {
+      if (account.pending[key] !== pending) return;
+      account.pending[key] = null;
+      reject(new Error(`${label} tidak menerima response API.`));
+    }, timeoutMs);
+    account.pending[key] = pending;
+  });
+}
+function resolveDirect(account, key, msg) {
+  const pending = account?.pending?.[key];
+  if (!pending || !pending.matcher(msg)) return false;
+  clearTimeout(pending.timer);
+  account.pending[key] = null;
+  if (!directResultOK(msg)) {
+    const e = apiErrorFromMessage(msg); const err = new Error(e.message || `${key} gagal.`); err.code=e.code; err.event=msg; pending.reject(err);
+  } else pending.resolve(msg);
+  return true;
+}
 
 function isVoteStartedKickEventServer(msg) {
   const data = msg?.data ?? msg ?? {};
@@ -161,11 +178,14 @@ function connectAccount(username, password, socketIndex = null) {
       let msg;
       try { msg = JSON.parse(raw.toString()); } catch { return; }
 
-      resolveBalance(sessionId, msg);
-      resolveMessageResult(sessionId, msg);
-      resolveParticipants(sessionId, msg);
-      resolveJoin(sessionId, msg);
-      resolveLeave(sessionId, msg);
+      const liveAccount = sessions.get(sessionId);
+      if (liveAccount) {
+        resolveDirect(liveAccount, "join", msg);
+        resolveDirect(liveAccount, "leave", msg);
+        resolveDirect(liveAccount, "participants", msg);
+        resolveDirect(liveAccount, "balance", msg);
+        resolveDirect(liveAccount, "message", msg);
+      }
 
       // Forward the raw API event. Socket 1 is explicitly tagged here so
       // the frontend never has to guess which authenticated WebSocket sent it.
@@ -203,9 +223,13 @@ function connectAccount(username, password, socketIndex = null) {
           socketIndex,
           permissions: Array.isArray(msg.data?.developer?.permissions) ? msg.data.developer.permissions : [],
           pingTimer: null,
-          countdownTrigger: null
+          countdownTrigger: null,
+          pending: { join:null, leave:null, participants:null, balance:null, message:null }
         };
+        const previous = usernameSessions.get(username.toLowerCase());
+        if (previous && previous !== sessionId) closeSession(previous, "relogin");
         sessions.set(sessionId, account);
+        usernameSessions.set(username.toLowerCase(), sessionId);
 
         socket.on("close", () => {
           if (sessions.get(sessionId)?.socket === socket) {
@@ -238,6 +262,7 @@ function connectAccount(username, password, socketIndex = null) {
 
       if (msg.type === "session.replaced") {
         publish(sessionId, { type: "login.status", status: "error", code: "session.replaced", message: "Session digantikan oleh login lain." });
+        closeSession(sessionId, "session replaced");
         return;
       }
 
@@ -257,203 +282,50 @@ function connectAccount(username, password, socketIndex = null) {
 
 
 function send(sessionId, payload) {
-  const account = sessions.get(sessionId);
-  if (!account) throw new Error("Session tidak ditemukan / sudah terputus.");
-  if (account.socket.readyState !== WebSocket.OPEN) throw new Error("WebSocket tidak terhubung.");
+  const account = getSession(sessionId);
   account.socket.send(JSON.stringify(payload));
 }
 
-function normalizeRoomName(value) {
-  return String(value ?? "").trim().toLowerCase();
-}
-
-function isSuccessfulDirectResult(msg) {
-  const data = msg?.data || {};
-  const status = String(data.status ?? msg?.status ?? "").trim().toLowerCase();
-  const { code } = extractApiError(msg);
-  if (code) return false;
-  return !["error", "failed", "failure", "denied", "rejected", "forbidden"].includes(status);
-}
-
-function waitForJoin(sessionId, room, timeoutMs = 8000) {
-  return new Promise((resolve, reject) => {
-    const entry = { room: normalizeRoomName(room), resolve, reject, timer: null };
-    entry.timer = setTimeout(() => {
-      const list = joinWaiters.get(sessionId) || [];
-      const next = list.filter(x => x !== entry);
-      if (next.length) joinWaiters.set(sessionId, next); else joinWaiters.delete(sessionId);
-      reject(new Error(`Timeout menunggu hasil Enter Room untuk room "${room}".`));
-    }, timeoutMs);
-    const list = joinWaiters.get(sessionId) || [];
-    list.push(entry);
-    joinWaiters.set(sessionId, list);
-  });
-}
-
-function resolveJoin(sessionId, msg) {
-  if (String(msg?.type || "").toLowerCase() !== "room.join.result") return false;
-  const list = joinWaiters.get(sessionId);
-  if (!list?.length) return false;
-
-  const room = normalizeRoomName(msg.data?.room ?? msg.room ?? "");
-  let index = room ? list.findIndex(x => x.room === room) : 0;
-  if (index < 0) return false;
-  const entry = list[index];
-  if (!entry) return false;
-
-  clearTimeout(entry.timer);
-  list.splice(index, 1);
-  if (list.length) joinWaiters.set(sessionId, list); else joinWaiters.delete(sessionId);
-
-  if (isSuccessfulDirectResult(msg)) {
-    const account = sessions.get(sessionId);
-    const joinedRoom = String(msg.data?.room ?? msg.room ?? entry.room).trim();
-    if (account) account.joinedRoom = joinedRoom;
-    entry.resolve(msg);
-  } else {
-    const apiErr = extractApiError(msg);
-    const err = new Error(apiErr.message || `Enter Room gagal${apiErr.code ? ` (${apiErr.code})` : ""}.`);
-    err.code = apiErr.code;
-    err.event = msg;
-    entry.reject(err);
+function commandJoin(sessionId, room) {
+  const account=getSession(sessionId), target=roomName(room), norm=normalizeRoomName(room);
+  if(!target) throw new Error("Room wajib diisi.");
+  if(account.joinedRoom) {
+    if(normalizeRoomName(account.joinedRoom)===norm) throw new Error(`Sudah berada di room "${account.joinedRoom}".`);
+    throw new Error(`Session sudah berada di room "${account.joinedRoom}".`);
   }
-  return true;
+  const waiter=waitForDirect(account,"join",msg=>String(msg?.type||"")==="room.join.result" && (!String(msg?.data?.room??msg?.room??"").trim() || normalizeRoomName(msg?.data?.room??msg?.room)===norm),`Enter Room ${target}`);
+  account.socket.send(JSON.stringify({type:"room.join",room:target}));
+  return waiter.then(event=>{ account.joinedRoom=roomName(event?.data?.room??event?.room??target)||target; return event; });
 }
-
-function waitForLeave(sessionId, room, timeoutMs = 8000) {
-  return new Promise((resolve, reject) => {
-    const entry = { room: normalizeRoomName(room), resolve, reject, timer: null };
-    entry.timer = setTimeout(() => {
-      const list = leaveWaiters.get(sessionId) || [];
-      const next = list.filter(x => x !== entry);
-      if (next.length) leaveWaiters.set(sessionId, next); else leaveWaiters.delete(sessionId);
-      reject(new Error(`Timeout menunggu hasil Leave Room untuk room "${room}".`));
-    }, timeoutMs);
-    const list = leaveWaiters.get(sessionId) || [];
-    list.push(entry);
-    leaveWaiters.set(sessionId, list);
-  });
+function commandLeave(sessionId, room) {
+  const account=getSession(sessionId), target=roomName(room), norm=normalizeRoomName(room);
+  if(!target) throw new Error("Room wajib diisi.");
+  if(!account.joinedRoom || normalizeRoomName(account.joinedRoom)!==norm) throw new Error(`Session tidak sedang berada di room "${target}".`);
+  const waiter=waitForDirect(account,"leave",msg=>String(msg?.type||"")==="room.leave.result" && (!String(msg?.data?.room??msg?.room??"").trim() || normalizeRoomName(msg?.data?.room??msg?.room)===norm),`Leave Room ${target}`);
+  account.socket.send(JSON.stringify({type:"room.leave",room:target}));
+  return waiter.then(event=>{account.joinedRoom=null;return event;});
 }
-
-function resolveLeave(sessionId, msg) {
-  if (String(msg?.type || "").toLowerCase() !== "room.leave.result") return false;
-  const list = leaveWaiters.get(sessionId);
-  if (!list?.length) return false;
-  const room = normalizeRoomName(msg.data?.room ?? msg.room ?? "");
-  let index = room ? list.findIndex(x => x.room === room) : 0;
-  if (index < 0) return false;
-  const entry = list[index];
-  if (!entry) return false;
-  clearTimeout(entry.timer);
-  list.splice(index, 1);
-  if (list.length) leaveWaiters.set(sessionId, list); else leaveWaiters.delete(sessionId);
-  if (isSuccessfulDirectResult(msg)) {
-    const account = sessions.get(sessionId);
-    if (account && normalizeRoomName(account.joinedRoom) === entry.room) account.joinedRoom = null;
-    entry.resolve(msg);
-  } else {
-    const apiErr = extractApiError(msg);
-    const err = new Error(apiErr.message || `Leave Room gagal${apiErr.code ? ` (${apiErr.code})` : ""}.`);
-    err.code = apiErr.code;
-    err.event = msg;
-    entry.reject(err);
-  }
-  return true;
+function commandParticipants(sessionId, room) {
+  const account=getSession(sessionId), target=roomName(room), norm=normalizeRoomName(room);
+  if(!target) throw new Error("Room wajib diisi.");
+  if(!account.joinedRoom || normalizeRoomName(account.joinedRoom)!==norm) throw new Error(`Session belum join room "${target}".`);
+  const waiter=waitForDirect(account,"participants",msg=>String(msg?.type||"")==="room.participants.result" && (!String(msg?.data?.room??msg?.room??"").trim() || normalizeRoomName(msg?.data?.room??msg?.room)===norm),`List Room ${target}`);
+  account.socket.send(JSON.stringify({type:"room.participants",room:target}));
+  return waiter;
 }
-
-function waitForParticipants(sessionId, room, timeoutMs = 10000) {
-  return new Promise((resolve, reject) => {
-    const entry = { room: String(room || "").trim(), resolve, reject, timer: null };
-    entry.timer = setTimeout(() => {
-      if (participantWaiters.get(sessionId) === entry) participantWaiters.delete(sessionId);
-      reject(new Error("Timeout menunggu room.participants."));
-    }, timeoutMs);
-    participantWaiters.set(sessionId, entry);
-  });
+function commandBalance(sessionId) {
+  const account=getSession(sessionId);
+  const waiter=waitForDirect(account,"balance",msg=>String(msg?.type||"")==="wallet.balance.result","Cek saldo");
+  account.socket.send(JSON.stringify({type:"wallet.balance"}));
+  return waiter.then(msg=>msg?.data?.wallet||null);
 }
-
-function resolveParticipants(sessionId, msg) {
-  const type = String(msg?.type || "").toLowerCase();
-  if (!type.includes("participant")) return false;
-
-  const entry = participantWaiters.get(sessionId);
-  if (!entry) return false;
-
-  const eventRoom = String(msg.data?.room ?? msg.room ?? "").trim();
-  if (entry.room && eventRoom && entry.room !== eventRoom) return false;
-
-  clearTimeout(entry.timer);
-  participantWaiters.delete(sessionId);
-  entry.resolve(msg);
-  return true;
+function commandMessage(sessionId, room, message) {
+  const account=getSession(sessionId), target=roomName(room), text=String(message||"").trim();
+  if(!target||!text) throw new Error("Room dan pesan wajib diisi.");
+  const waiter=waitForDirect(account,"message",msg=>["room.send_message.queued","error"].includes(String(msg?.type||"")),"Kirim pesan");
+  account.socket.send(JSON.stringify({type:"room.send_message",room:target,message:text}));
+  return waiter;
 }
-
-function waitForBalance(sessionId, timeoutMs = 8000) {
-  return new Promise((resolve, reject) => {
-    const old = balanceWaiters.get(sessionId);
-    if (old?.timer) clearTimeout(old.timer);
-    const entry = { resolve, reject, timer: null };
-    entry.timer = setTimeout(() => {
-      if (balanceWaiters.get(sessionId) === entry) balanceWaiters.delete(sessionId);
-      reject(new Error("Timeout menunggu wallet.balance.result."));
-    }, timeoutMs);
-    balanceWaiters.set(sessionId, entry);
-  });
-}
-
-function resolveBalance(sessionId, msg) {
-  if (msg?.type !== "wallet.balance.result") return false;
-  const entry = balanceWaiters.get(sessionId);
-  if (!entry) return false;
-  clearTimeout(entry.timer);
-  balanceWaiters.delete(sessionId);
-  const wallet = msg?.data?.wallet || null;
-  if (!wallet) {
-    entry.reject(new Error("wallet.balance.result tidak berisi data wallet."));
-    return true;
-  }
-  entry.resolve(wallet);
-  return true;
-}
-
-function waitForMessageResult(sessionId, timeoutMs = 8000) {
-  return new Promise((resolve, reject) => {
-    const key = String(sessionId);
-    const list = messageWaiters.get(key) || [];
-    const entry = { resolve, reject, timer: null };
-    entry.timer = setTimeout(() => {
-      const current = messageWaiters.get(key) || [];
-      const next = current.filter(x => x !== entry);
-      if (next.length) messageWaiters.set(key, next); else messageWaiters.delete(key);
-      reject(new Error("Timeout menunggu respons room.send_message."));
-    }, timeoutMs);
-    list.push(entry);
-    messageWaiters.set(key, list);
-  });
-}
-
-function resolveMessageResult(sessionId, msg) {
-  const type = String(msg?.type || "");
-  if(type !== "room.send_message.queued" && type !== "error") return false;
-  const key = String(sessionId);
-  const list = messageWaiters.get(key);
-  if(!list?.length) return false;
-  messageWaiters.delete(key);
-  for(const entry of list) clearTimeout(entry.timer);
-  if(type === "error") {
-    const apiErr = extractApiError(msg);
-    for(const entry of list) entry.reject(new Error(apiErr.message || "room.send_message gagal."));
-  } else {
-    for(const entry of list) entry.resolve(msg);
-  }
-  return true;
-}
-
-function extractJobId(msg) {
-  return String(msg?.data?.job?.job_id ?? msg?.data?.job_id ?? msg?.job_id ?? "").trim();
-}
-
-function getActiveSessionIds() { return [...sessions.keys()]; }
 
 app.get("/api/health", (_req, res) => {
   res.json({ ok: true, service: "MIG Duel Kick 10", activeSessions: sessions.size });
@@ -464,7 +336,10 @@ app.post("/api/login", async (req, res) => {
   const { username, password } = req.body || {};
   if (!username || !password) return res.status(400).json({ ok: false, error: "Username dan password wajib diisi." });
   try {
-    const result = await connectAccount(String(username).trim(), String(password), 0);
+    const cleanUsername = String(username).trim();
+    const oldSession = usernameSessions.get(cleanUsername.toLowerCase());
+    if (oldSession) closeSession(oldSession, "relogin");
+    const result = await connectAccount(cleanUsername, String(password), 0);
     res.json({ ok: true, account: result });
   } catch (e) {
     const status = classifyLoginFailure(e);
@@ -474,29 +349,18 @@ app.post("/api/login", async (req, res) => {
 
 // ONE HTTP command opens the 10 required, separate WebSockets concurrently.
 app.post("/api/login-batch", async (req, res) => {
-  const input = Array.isArray(req.body?.accounts) ? req.body.accounts.slice(0, 10) : [];
-  if (!input.length) return res.status(400).json({ ok: false, error: "Tidak ada Troop untuk login." });
-
-  const jobs = input.map(async (item) => {
-    const index = Number.isInteger(item?.index) ? item.index : input.indexOf(item);
-    const username = String(item?.username || "").trim();
-    const password = String(item?.password || "");
-    if (!username || !password) return { index, ok: false, error: "Nama dan password kosong." };
-
-    // Replace an existing session for the same Troop slot before reconnecting.
-    const oldSessionId = String(item?.sessionId || "");
-    if (oldSessionId) closeSession(oldSessionId, "relogin");
-
-    try {
-      const account = await connectAccount(username, password, index);
-      return { index, ok: true, account };
-    } catch (e) {
-      return { index, ok: false, username, status: classifyLoginFailure(e), code: String(e?.code || ""), error: safeError(e) };
-    }
-  });
-
-  const results = await Promise.all(jobs);
-  res.json({ ok: results.some(x => x.ok), results });
+  const input=Array.isArray(req.body?.accounts)?req.body.accounts.slice(0,10):[];
+  if(!input.length) return res.status(400).json({ok:false,error:"Tidak ada akun untuk login."});
+  const seen=new Set();
+  const results=await Promise.all(input.map(async(item,pos)=>{
+    const index=Number.isInteger(item?.index)?item.index:pos, username=String(item?.username||"").trim(), password=String(item?.password||"");
+    if(!username||!password) return {index,ok:false,error:"Username dan password wajib diisi."};
+    const key=username.toLowerCase(); if(seen.has(key)) return {index,ok:false,error:"Username yang sama tidak boleh login dua kali."}; seen.add(key);
+    const old=usernameSessions.get(username.toLowerCase()); if(old) closeSession(old,"relogin"); if(item?.sessionId) closeSession(String(item.sessionId),"relogin");
+    try { return {index,ok:true,account:await connectAccount(username,password,index)}; }
+    catch(e){ return {index,ok:false,username,status:classifyLoginFailure(e),code:String(e?.code||""),error:safeError(e)}; }
+  }));
+  res.json({ok:results.some(x=>x.ok),results});
 });
 
 function createKickExecution(meta) {
@@ -595,158 +459,48 @@ app.get("/api/events", (req, res) => {
 });
 
 // Single-account action retained for individual Troop controls.
-app.post("/api/action", async (req, res) => {
-  const { sessionId, action, room, targetUsername, message } = req.body || {};
-  if (!sessionId || !action) return res.status(400).json({ ok: false, error: "Parameter tidak lengkap." });
+app.post("/api/action", async (req,res)=>{
+  const {sessionId,action,room,targetUsername,message}=req.body||{};
+  if(!sessionId||!action) return res.status(400).json({ok:false,error:"Parameter tidak lengkap."});
   try {
-    if (action === "join") {
-      if (!room) throw new Error("Room wajib diisi.");
-      const waiter = waitForJoin(sessionId, room);
-      try {
-        send(sessionId, { type: "room.join", room });
-        const event = await waiter;
-        return res.json({ ok: true, sent: action, event });
-      } catch (e) {
-        return res.status(400).json({ ok: false, error: safeError(e), event: e?.event || null });
-      }
-    }
-    else if (action === "leave") {
-      if (!room) throw new Error("Room wajib diisi.");
-      const waiter = waitForLeave(sessionId, room);
-      try {
-        send(sessionId, { type: "room.leave", room });
-        const event = await waiter;
-        return res.json({ ok: true, sent: action, event });
-      } catch (e) {
-        return res.status(400).json({ ok: false, error: safeError(e), event: e?.event || null });
-      }
-    }
-    else if (action === "participants") {
-      if (!room) throw new Error("Room wajib diisi.");
-      const waiter = waitForParticipants(sessionId, room, 10000);
-      try {
-        send(sessionId, { type: "room.participants", room });
-        const event = await waiter;
-        return res.json({ ok: true, sent: action, event });
-      } catch (e) {
-        const pending = participantWaiters.get(sessionId);
-        if (pending?.timer) clearTimeout(pending.timer);
-        participantWaiters.delete(sessionId);
-        throw e;
-      }
-    }
-    else if (action === "kick") { if (!room || !targetUsername) throw new Error("Room dan target wajib diisi."); send(sessionId, { type: "room.kick", room, target_username: targetUsername }); }
-    else if (action === "message") { if (!room || !message) throw new Error("Room dan pesan wajib diisi."); send(sessionId, { type: "room.send_message", room, message }); }
-    else if (action === "balance") send(sessionId, { type: "wallet.balance" });
+    let event;
+    if(action==="join") event=await commandJoin(sessionId,room);
+    else if(action==="leave") event=await commandLeave(sessionId,room);
+    else if(action==="participants") event=await commandParticipants(sessionId,room);
+    else if(action==="balance") event=await commandBalance(sessionId);
+    else if(action==="message") event=await commandMessage(sessionId,room,message);
+    else if(action==="kick"){if(!room||!targetUsername)throw new Error("Room dan target wajib diisi.");send(sessionId,{type:"room.kick",room:roomName(room),target_username:String(targetUsername).trim()});}
     else throw new Error("Action tidak dikenal.");
-    res.json({ ok: true, sent: action });
-  } catch (e) { res.status(400).json({ ok: false, error: safeError(e) }); }
+    res.json({ok:true,sent:action,event:action==="balance"?null:event,wallet:action==="balance"?event:null});
+  } catch(e){res.status(400).json({ok:false,error:safeError(e),event:e?.event||null});}
 });
 
-// Balance is a direct WebSocket response. Collect the response per session so
-// CEK SALDO ALL does not depend on the single room-event SSE connection.
-app.post("/api/balance-all", async (req, res) => {
-  const ids = Array.isArray(req.body?.sessionIds)
-    ? [...new Set(req.body.sessionIds.map(String))].slice(0, 10)
-    : [];
-  if (!ids.length) return res.status(400).json({ ok: false, error: "Tidak ada Troop yang ONLINE." });
+app.post("/api/balance-all", async(req,res)=>{
+  const ids=Array.isArray(req.body?.sessionIds)?[...new Set(req.body.sessionIds.map(String))].slice(0,10):[];
+  if(!ids.length)return res.status(400).json({ok:false,error:"Tidak ada Troop yang ONLINE."});
+  const results=await Promise.all(ids.map(async sessionId=>{try{const wallet=await commandBalance(sessionId);return {sessionId,ok:true,wallet};}catch(e){return {sessionId,ok:false,error:safeError(e)};}}));
+  const success=results.filter(x=>x.ok).length; res.json({ok:success>0,action:"balance",sent:ids.length,success,total:results.length,results});
+});
 
-  const results = await Promise.all(ids.map(async (sessionId) => {
-    try {
-      const waiter = waitForBalance(sessionId, 8000);
-      send(sessionId, { type: "wallet.balance" });
-      const wallet = await waiter;
-      return { sessionId, ok: true, wallet };
-    } catch (e) {
-      const pending = balanceWaiters.get(sessionId);
-      if (pending?.timer) clearTimeout(pending.timer);
-      balanceWaiters.delete(sessionId);
-      return { sessionId, ok: false, error: safeError(e) };
-    }
+app.post("/api/batch-action", async(req,res)=>{
+  const {sessionIds,action,room,targetUsername,message}=req.body||{};
+  const ids=Array.isArray(sessionIds)?[...new Set(sessionIds.map(String))].slice(0,10):[];
+  if(!ids.length||!action)return res.status(400).json({ok:false,error:"Session atau action tidak lengkap."});
+  const results=await Promise.all(ids.map(async sessionId=>{
+    try{
+      let event;
+      if(action==="join")event=await commandJoin(sessionId,room);
+      else if(action==="leave")event=await commandLeave(sessionId,room);
+      else if(action==="participants")event=await commandParticipants(sessionId,room);
+      else if(action==="balance")event=await commandBalance(sessionId);
+      else if(action==="message")event=await commandMessage(sessionId,room,message);
+      else if(action==="kick"){if(!room||!targetUsername)throw new Error("Room dan target wajib diisi.");send(sessionId,{type:"room.kick",room:roomName(room),target_username:String(targetUsername).trim()});}
+      else throw new Error("Action tidak dikenal.");
+      return {sessionId,ok:true,event:action==="balance"?null:event,wallet:action==="balance"?event:null};
+    }catch(e){return {sessionId,ok:false,error:safeError(e),event:e?.event||null};}
   }));
-
-  const success = results.filter(x => x.ok).length;
-  res.json({ ok: success > 0, action: "balance", sent: ids.length, success, total: ids.length, results });
+  const success=results.filter(x=>x.ok).length; res.json({ok:success===results.length&&results.length>0,action,room:roomName(room),sent:ids.length,success,total:results.length,results});
 });
-
-// ONE HTTP command dispatches the same official command concurrently to up to 10 WebSockets.
-app.post("/api/batch-action", async (req, res) => {
-  const { sessionIds, action, room, targetUsername, message } = req.body || {};
-  const ids = Array.isArray(sessionIds) ? [...new Set(sessionIds.map(String))].slice(0, 10) : [];
-  if (!ids.length || !action) return res.status(400).json({ ok: false, error: "Session atau action tidak lengkap." });
-
-  if (action === "join") {
-    if (!room) return res.status(400).json({ ok: false, error: "Room wajib diisi." });
-    const jobs = ids.map(async (sessionId) => {
-      try {
-        const waiter = waitForJoin(sessionId, room);
-        send(sessionId, { type: "room.join", room });
-        const event = await waiter;
-        return { sessionId, ok: true, event };
-      } catch (e) {
-        return { sessionId, ok: false, error: safeError(e), event: e?.event || null };
-      }
-    });
-    const results = await Promise.all(jobs);
-    const success = results.filter(x => x.ok).length;
-    return res.json({ ok: success === results.length && results.length > 0, action, room, sent: ids.length, success, total: results.length, results });
-  }
-
-  if (action === "leave") {
-    if (!room) return res.status(400).json({ ok: false, error: "Room wajib diisi." });
-    const results = await Promise.all(ids.map(async (sessionId) => {
-      try {
-        const waiter = waitForLeave(sessionId, room);
-        send(sessionId, { type: "room.leave", room });
-        const event = await waiter;
-        return { sessionId, ok: true, event };
-      } catch (e) {
-        return { sessionId, ok: false, error: safeError(e), event: e?.event || null };
-      }
-    }));
-    const success = results.filter(x => x.ok).length;
-    return res.json({ ok: success > 0, action, room, sent: ids.length, success, total: results.length, results });
-  }
-
-  if (action === "participants") {
-    if (!room) return res.status(400).json({ ok: false, error: "Room wajib diisi." });
-    const results = await Promise.all(ids.map(async (sessionId) => {
-      try {
-        const waiter = waitForParticipants(sessionId, room);
-        send(sessionId, { type: "room.participants", room });
-        const event = await waiter;
-        return { sessionId, ok: true, event };
-      } catch (e) {
-        return { sessionId, ok: false, error: safeError(e), event: e?.event || null };
-      }
-    }));
-    const success = results.filter(x => x.ok).length;
-    return res.json({ ok: success > 0, action, room, sent: ids.length, success, total: results.length, results });
-  }
-
-  let payload;
-  if (action === "balance") payload = { type: "wallet.balance" };
-  else if (action === "kick") { if (!room || !targetUsername) return res.status(400).json({ ok: false, error: "Room dan target wajib diisi." }); payload = { type: "room.kick", room, target_username: targetUsername }; }
-  else if (action === "message") { if (!room || !message) return res.status(400).json({ ok: false, error: "Room dan pesan wajib diisi." }); payload = { type: "room.send_message", room, message }; }
-  else return res.status(400).json({ ok: false, error: "Action tidak dikenal." });
-
-  const results = [];
-  for (const sessionId of ids) {
-    try { send(sessionId, payload); results.push({ sessionId, ok: true }); }
-    catch (e) { results.push({ sessionId, ok: false, error: safeError(e) }); }
-  }
-  res.json({ ok: results.some(x => x.ok), action, sent: results.filter(x => x.ok).length, total: results.length, results });
-});
-
-function sleep(ms) {
-  return new Promise(resolve => setTimeout(resolve, Math.max(0, Number(ms) || 0)));
-}
-
-function waitBatchDelay(delayMs) {
-  const ms = Math.max(0, Number(delayMs) || 0);
-  return ms > 0 ? sleep(ms) : Promise.resolve();
-}
-
 
 app.post("/api/kick-loop", async (req, res) => {
   const body = req.body || {};
@@ -1084,18 +838,14 @@ app.post("/api/kick-loop", async (req, res) => {
   });
 });
 
-app.post("/api/logout", (req, res) => {
-  const { sessionId } = req.body || {};
-  closeSession(String(sessionId || ""), "logout");
-  res.json({ ok: true });
+app.post("/api/logout",(req,res)=>{
+  const id=String(req.body?.sessionId||"");
+  const closed=closeSession(id,"logout");
+  res.json({ok:true,closed,remaining:sessions.size});
 });
-
-// ONE logout command for all active sessions.
-app.post("/api/logout-batch", (_req, res) => {
-  const ids = getActiveSessionIds();
-  let closed = 0;
-  for (const id of ids) if (closeSession(id, "logout all")) closed++;
-  res.json({ ok: true, closed, remaining: sessions.size });
+app.post("/api/logout-batch",(_req,res)=>{
+  const ids=getActiveSessionIds(); let closed=0; for(const id of ids)if(closeSession(id,"logout all"))closed++;
+  res.json({ok:true,closed,remaining:sessions.size});
 });
 
 app.get("*", (_req, res) => res.sendFile(path.join(__dirname, "public", "index.html")));
