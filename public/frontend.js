@@ -740,14 +740,15 @@ function toggleAccountCommands(){
 }
 
 async function logoutAll(){
-  const ids = accounts.map(a => a.sessionId).filter(Boolean);
   accounts.forEach(a => { if(a.eventSource) try{ a.eventSource.close(); }catch{}; a.eventSource = null; });
-  try{ await fetch("/api/logout-batch", {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({sessionIds:ids})}); }catch{}
+  try{ await fetch("/api/logout-batch", {method:"POST", headers:{"Content-Type":"application/json"}, body:"{}"}); }catch{}
   for(let i=0; i<10; i++){
     accounts[i].sessionId = null;
+    accounts[i].joinedRoom = null;
     setStatus(i, "OFFLINE");
     setBalance(i, "-");
   }
+  clearParticipants();
   resetKickAllProgress("Progress KICK ALL di-reset karena semua WebSocket logout.");
 }
 
@@ -859,47 +860,43 @@ el("logoutAll").onclick = logoutAll;
 async function joinAll(){
   const room = el("room").value.trim();
   if(!room) return;
-
   const result = await batchAction("join", {room});
   if(!result) return;
-
   for(const item of (result.results || [])){
     const i = accounts.findIndex(a => a.sessionId === item.sessionId);
-    if(i < 0) continue;
-    if(item.ok){
-      const joinedRoom = String(item.event?.data?.room ?? item.event?.room ?? room).trim();
-      accounts[i].joinedRoom = joinedRoom || room;
-    }
+    if(i < 0 || !item.ok) continue;
+    const joinedRoom = String(item.event?.data?.room ?? item.event?.room ?? room).trim();
+    accounts[i].joinedRoom = joinedRoom || room;
   }
 }
 
 async function leaveAll(){
   const room = el("room").value.trim();
-  if(!room){ ; return; }
-  await batchAction("leave", {room});
+  if(!room) return;
+  const result = await batchAction("leave", {room});
+  if(result){
+    for(const item of (result.results || [])){
+      if(!item.ok) continue;
+      const i = accounts.findIndex(a => a.sessionId === item.sessionId);
+      if(i >= 0 && String(accounts[i].joinedRoom || "").trim().toLowerCase() === room.toLowerCase()) accounts[i].joinedRoom = null;
+    }
+  }
   resetKickAllProgress("Progress KICK ALL di-reset karena semua WebSocket meninggalkan room.");
 }
 
-
-
 async function participants(){
   const room = el("room").value.trim();
-  if(!room){ ; return; }
+  if(!room) return;
   clearParticipants();
-  const sessionId = accounts.map(a => a.sessionId).filter(Boolean)[0];
-  if(!sessionId){ ; return; }
-  try{
-    const r = await fetch("/api/action", {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({sessionId, action:"participants", room})});
-    const j = await r.json();
-    if(!j.ok){ return; }
-    const list = extractParticipantNames(j.event || j);
-    if(list.length){
-      renderParticipants(list, false);
-    } else {
-      el("participantsList").innerHTML = '<div class="flex items-center justify-center h-full text-xs text-slate-500 py-10">Tidak ada peserta.</div>';
-    }
-  }catch(e){
+  const result = await batchAction("participants", {room});
+  if(!result) return;
+  const all = [];
+  for(const item of (result.results || [])){
+    if(item.ok) all.push(...extractParticipantNames(item.event || {}));
   }
+  const unique = [...new Set(all)];
+  if(unique.length) renderParticipants(unique, false);
+  else el("participantsList").innerHTML = '<div class="flex items-center justify-center h-full text-xs text-slate-500 py-10">Tidak ada peserta.</div>';
 }
 
 async function balanceAll(){
