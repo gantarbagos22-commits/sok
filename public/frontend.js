@@ -2,7 +2,6 @@
 const accounts = Array.from({length:10},()=>({sessionId:null,username:"",password:"",balance:"-",eventSource:null,status:"OFFLINE"}));
 const targets = [];
 const participantNames = [];
-const roomActionBusy = new Set();
 const el = id => document.getElementById(id);
 
 
@@ -117,18 +116,26 @@ function clearFields(){
 }
 
 function openEvents(i){
-  const a=accounts[i]; if(!a.sessionId)return;
-  if(a.eventSource)try{a.eventSource.close();}catch{}
-  const sessionId=a.sessionId;
-  const es=new EventSource(`/api/events?sessionId=${encodeURIComponent(sessionId)}`);
-  a.eventSource=es;
-  es.onmessage=ev=>{
-    if(accounts[i]?.sessionId!==sessionId)return;
-    try{handleApiEvent(i,JSON.parse(ev.data));}catch{}
+  const a = accounts[i];
+  if(!a.sessionId) return;
+  if(a.eventSource) try{ a.eventSource.close(); }catch{}
+  const sessionId = a.sessionId;
+  const es = new EventSource(`/api/events?sessionId=${encodeURIComponent(sessionId)}`);
+  a.eventSource = es;
+  es.onmessage = (ev) => {
+    if(accounts[i]?.sessionId !== sessionId) return;
+    try{
+      const msg = JSON.parse(ev.data);
+      handleApiEvent(i, msg);
+    }catch{}
   };
-  es.onerror=()=>{
-    try{es.close();}catch{}
-    if(a.eventSource===es)a.eventSource=null;
+  es.onerror = () => {
+    try{ es.close(); }catch{}
+    if(accounts[i]?.sessionId === sessionId){
+      setTimeout(() => {
+        if(accounts[i]?.sessionId === sessionId) openEvents(i);
+      }, 1000);
+    }
   };
 }
 
@@ -392,17 +399,8 @@ function handleApiEvent(i, msg){
     startCountdown(countdownMs, eventKey);
   }
   if(msg.type === "room.join.result"){
-    const data=msg.data||{};
-    const status=String(data.status??msg.status??"").toLowerCase();
-    const error=String(data.error??data.error_code??msg.error??msg.error_code??"");
-    const joinedRoom=String(data.room??msg.room??"").trim();
-    if(!error && !["error","failed","failure","denied","rejected","forbidden"].includes(status) && joinedRoom) accounts[i].joinedRoom=joinedRoom;
-  }
-  if(msg.type === "room.leave.result"){
-    const data=msg.data||{};
-    const status=String(data.status??msg.status??"").toLowerCase();
-    const error=String(data.error??data.error_code??msg.error??msg.error_code??"");
-    if(!error && !["error","failed","failure","denied","rejected","forbidden"].includes(status)) accounts[i].joinedRoom=null;
+    const joinedRoom = String(msg.data?.room ?? msg.room ?? "").trim();
+    if(joinedRoom) accounts[i].joinedRoom = joinedRoom;
   }
   if(msg.type === "wallet.balance.result" || msg.type === "wallet.transfer.result"){
     const w = msg.data?.wallet;
@@ -412,12 +410,10 @@ function handleApiEvent(i, msg){
   if(msg.type === "session.replaced"){
     setStatus(i, "ERROR");
     accounts[i].sessionId = null;
-    accounts[i].joinedRoom = null;
     setBalance(i, "-");
   }
   if(msg.type === "session.closed"){
     accounts[i].sessionId = null;
-    accounts[i].joinedRoom = null;
     setStatus(i, "OFFLINE");
     setBalance(i, "-");
   }
@@ -655,49 +651,69 @@ async function loginOne(i){
   }
 }
 
-async function logoutOne(i,silent=false){
-  const a=accounts[i];
-  const sessionId=a.sessionId;
-  if(a.eventSource)try{a.eventSource.close();}catch{}
-  a.eventSource=null; a.sessionId=null; a.joinedRoom=null;
-  setStatus(i,"OFFLINE"); setBalance(i,"-");
-  if(sessionId){try{await fetch("/api/logout",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({sessionId})});}catch{}}
-  if(!silent)clearParticipants();
+async function logoutOne(i, silent=false){
+  const a = accounts[i];
+  if(a.eventSource) try{ a.eventSource.close(); }catch{}
+  a.eventSource = null;
+  if(a.sessionId){
+    try{ await fetch("/api/logout", {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({sessionId:a.sessionId})}); }catch{}
+  }
+  a.sessionId = null;
+  a.joinedRoom = null;
+  setStatus(i, "OFFLINE");
+  setBalance(i, "-");
+  if(!silent) ;
 }
 
-async function batchAction(action,extra={}){
-  if(roomActionBusy.has(action))return null;
-  const ids=accounts.map(a=>a.sessionId).filter(Boolean);
-  if(!ids.length)return null;
-  roomActionBusy.add(action);
+async function batchAction(action, extra={}){
+  const ids = accounts.map(a => a.sessionId).filter(Boolean);
+  if(!ids.length) return null;
   try{
-    const r=await fetch("/api/batch-action",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({sessionIds:ids,action,...extra})});
-    return await r.json();
-  }catch{return null;}finally{roomActionBusy.delete(action);}
+    const r = await fetch("/api/batch-action", {
+      method:"POST",
+      headers:{"Content-Type":"application/json"},
+      body:JSON.stringify({sessionIds:ids, action, ...extra})
+    });
+    const j = await r.json();
+    return j;
+  }catch(e){
+    return null;
+  }
 }
 
 async function loginAll(){
-  if(roomActionBusy.has("login"))return;
   sync();
-  const list=accounts.map((a,i)=>({index:i,username:a.username,password:a.password,sessionId:a.sessionId})).filter(a=>a.username&&a.password);
-  if(!list.length)return;
-  roomActionBusy.add("login");
+  const list = accounts.map((a, i) => ({index:i, username:a.username, password:a.password, sessionId:a.sessionId})).filter(a => a.username && a.password);
+  if(!list.length){ ; return; }
+  list.forEach(a => setStatus(a.index, "LOGIN…"));
   try{
-    // Hapus seluruh session lama di backend sebelum membuat koneksi baru.
-    try{await fetch("/api/logout-batch",{method:"POST",headers:{"Content-Type":"application/json"},body:"{}"});}catch{}
-    for(const a of accounts){if(a.eventSource)try{a.eventSource.close();}catch{} a.eventSource=null;a.sessionId=null;a.joinedRoom=null;}
-    list.forEach(a=>setStatus(a.index,"LOGIN…"));
-    const r=await fetch("/api/login-batch",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({accounts:list})});
-    const j=await r.json();
-    for(const item of(j.results||[])){
-      const i=item.index; if(!accounts[i])continue;
+    const r = await fetch("/api/login-batch", {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({accounts:list})});
+    const j = await r.json();
+    for(const item of (j.results || [])){
+      const i = item.index;
       if(item.ok){
-        accounts[i].sessionId=item.account.sessionId; accounts[i].joinedRoom=null;
-        const w=item.account.wallet; setBalance(i,w?.balance_cr??w?.label??"-"); setStatus(i,"ONLINE"); openEvents(i);
-      }else{accounts[i].sessionId=null;setStatus(i,String(item.status||"error").toUpperCase()==="SUSPEND"?"SUSPEND":"ERROR");setBalance(i,"-");}
+        accounts[i].sessionId = item.account.sessionId;
+        accounts[i].joinedRoom = null;
+        const w = item.account.wallet;
+        if(w?.balance_cr != null) setBalance(i, w.balance_cr);
+        else if(w?.label) setBalance(i, w.label);
+        else setBalance(i, "-");
+        setStatus(i, "ONLINE");
+        openEvents(i);
+          } else {
+        accounts[i].sessionId = null;
+        const status = String(item.status || "error").toUpperCase() === "SUSPEND" ? "SUSPEND" : "ERROR";
+        setStatus(i, status);
+        setBalance(i, "-");
+      }
     }
-  }catch{for(const a of list)setStatus(a.index,"ERROR");}
-  finally{roomActionBusy.delete("login");resetKickAllProgress("Progress KICK ALL di-reset setelah LOGIN ALL.");}
+    const ok = (j.results || []).filter(x => x.ok).length;
+    const total = (j.results || []).length;
+    for(const item of (j.results || [])) if(!item.ok) ;
+  }catch(e){
+    for(const a of list) setStatus(a.index, "ERROR");
+  }
+  resetKickAllProgress("Progress KICK ALL di-reset setelah LOGIN ALL.");
 }
 
 function toggleAccountCommands(){
@@ -724,19 +740,16 @@ function toggleAccountCommands(){
 }
 
 async function logoutAll(){
-  if(roomActionBusy.has("logout"))return;
-  roomActionBusy.add("logout");
-  try{
-    // Backend menjadi sumber kebenaran: tutup SEMUA session aktif, termasuk
-    // session yang sudah tidak lagi diketahui browser.
-    try{await fetch("/api/logout-batch",{method:"POST",headers:{"Content-Type":"application/json"},body:"{}"});}catch{}
-    for(let i=0;i<10;i++){
-      const a=accounts[i]; if(a.eventSource)try{a.eventSource.close();}catch{}
-      a.eventSource=null;a.sessionId=null;a.joinedRoom=null;setStatus(i,"OFFLINE");setBalance(i,"-");
-    }
-    clearParticipants();
-    resetKickAllProgress("Progress KICK ALL di-reset karena semua WebSocket logout.");
-  }finally{roomActionBusy.delete("logout");}
+  accounts.forEach(a => { if(a.eventSource) try{ a.eventSource.close(); }catch{}; a.eventSource = null; });
+  try{ await fetch("/api/logout-batch", {method:"POST", headers:{"Content-Type":"application/json"}, body:"{}"}); }catch{}
+  for(let i=0; i<10; i++){
+    accounts[i].sessionId = null;
+    accounts[i].joinedRoom = null;
+    setStatus(i, "OFFLINE");
+    setBalance(i, "-");
+  }
+  clearParticipants();
+  resetKickAllProgress("Progress KICK ALL di-reset karena semua WebSocket logout.");
 }
 
 el("resetTimerButton")?.addEventListener("click", resetTimer);
@@ -845,32 +858,45 @@ el("loginAll").onclick = loginAll;
 el("logoutAll").onclick = logoutAll;
 
 async function joinAll(){
-  const room=el("room").value.trim(); if(!room)return;
-  const result=await batchAction("join",{room}); if(!result)return;
-  for(const item of(result.results||[])){
-    const i=accounts.findIndex(a=>a.sessionId===item.sessionId); if(i<0)continue;
-    if(item.ok){accounts[i].joinedRoom=String(item.event?.data?.room??item.event?.room??room).trim()||room;}
+  const room = el("room").value.trim();
+  if(!room) return;
+  const result = await batchAction("join", {room});
+  if(!result) return;
+  for(const item of (result.results || [])){
+    const i = accounts.findIndex(a => a.sessionId === item.sessionId);
+    if(i < 0 || !item.ok) continue;
+    const joinedRoom = String(item.event?.data?.room ?? item.event?.room ?? room).trim();
+    accounts[i].joinedRoom = joinedRoom || room;
   }
 }
 
 async function leaveAll(){
-  const room=el("room").value.trim(); if(!room)return;
-  const result=await batchAction("leave",{room}); if(!result)return;
-  for(const item of(result.results||[])){
-    if(!item.ok)continue; const i=accounts.findIndex(a=>a.sessionId===item.sessionId);
-    if(i>=0)accounts[i].joinedRoom=null;
+  const room = el("room").value.trim();
+  if(!room) return;
+  const result = await batchAction("leave", {room});
+  if(result){
+    for(const item of (result.results || [])){
+      if(!item.ok) continue;
+      const i = accounts.findIndex(a => a.sessionId === item.sessionId);
+      if(i >= 0 && String(accounts[i].joinedRoom || "").trim().toLowerCase() === room.toLowerCase()) accounts[i].joinedRoom = null;
+    }
   }
   resetKickAllProgress("Progress KICK ALL di-reset karena semua WebSocket meninggalkan room.");
 }
 
 async function participants(){
-  const room=el("room").value.trim(); if(!room)return;
+  const room = el("room").value.trim();
+  if(!room) return;
   clearParticipants();
-  const result=await batchAction("participants",{room}); if(!result)return;
-  const all=[]; for(const item of(result.results||[]))if(item.ok)all.push(...extractParticipantNames(item.event||{}));
-  const unique=[...new Set(all)];
-  if(unique.length)renderParticipants(unique,false);
-  else el("participantsList").innerHTML='<div class="flex items-center justify-center h-full text-xs text-slate-500 py-10">Tidak ada peserta.</div>';
+  const result = await batchAction("participants", {room});
+  if(!result) return;
+  const all = [];
+  for(const item of (result.results || [])){
+    if(item.ok) all.push(...extractParticipantNames(item.event || {}));
+  }
+  const unique = [...new Set(all)];
+  if(unique.length) renderParticipants(unique, false);
+  else el("participantsList").innerHTML = '<div class="flex items-center justify-center h-full text-xs text-slate-500 py-10">Tidak ada peserta.</div>';
 }
 
 async function balanceAll(){
