@@ -1,0 +1,220 @@
+
+const accounts = Array.from({length:10},()=>({sessionId:null,username:"",password:"",balance:"-",eventSource:null,status:"OFFLINE"}));
+const targets = [];
+const participantNames = [];
+const el = id => document.getElementById(id);
+
+
+function esc(v){
+  return String(v??"").replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/\"/g,"&quot;");
+}
+
+function sync(){
+  for(let i=0; i<10; i++){
+    if(el(`u${i}`)) accounts[i].username = el(`u${i}`).value.trim();
+    if(el(`p${i}`)) accounts[i].password = el(`p${i}`).value;
+  }
+}
+
+function renderAccounts(){
+  el("accounts").innerHTML = accounts.map((a, i) => `
+    <div class="troop-card">
+      <div class="troop-main">
+        <div class="troop-id">
+          <span class="troop-name">T${i+1}</span>
+          <span id="status${i}" title="${esc(a.status || (a.sessionId ? "ONLINE" : "OFFLINE"))}" aria-label="Status Troop ${i+1}: ${esc(a.status || (a.sessionId ? "ONLINE" : "OFFLINE"))}" class="troop-status ${a.status === 'ONLINE' ? 'online' : a.status === 'SUSPEND' ? 'suspend' : a.status === 'ERROR' ? 'error' : a.status === 'OFFLINE' ? 'offline' : a.status === 'LOGIN…' || a.status === 'LOGIN...' ? 'login' : ''}"></span>
+        </div>
+        <div class="troop-credentials">
+          <input id="u${i}" value="${esc(a.username)}" class="troop-input" placeholder="Username" autocomplete="off" aria-label="Username Troop ${i+1}">
+          <input id="p${i}" value="${esc(a.password)}" type="password" class="troop-input" placeholder="Password" autocomplete="off" aria-label="Password Troop ${i+1}">
+        </div>
+        <span id="b${i}" class="troop-balance" title="Saldo">${esc(a.balance === '-' ? '0' : a.balance)}</span>
+        <button onclick="loginOne(${i})" class="troop-icon login-icon" title="Login Troop ${i+1}" aria-label="Login Troop ${i+1}">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><path stroke-linecap="round" stroke-linejoin="round" d="M15 3h4a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2h-4"/><path stroke-linecap="round" stroke-linejoin="round" d="m10 17 5-5-5-5M15 12H3"/></svg>
+        </button>
+        <button onclick="logoutOne(${i})" class="troop-icon logout-icon" title="Logout Troop ${i+1}" aria-label="Logout Troop ${i+1}">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><path stroke-linecap="round" stroke-linejoin="round" d="M10 17l5-5-5-5"/><path stroke-linecap="round" stroke-linejoin="round" d="M15 12H3"/><path stroke-linecap="round" stroke-linejoin="round" d="M15 3h4a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2h-4"/></svg>
+        </button>
+      </div>
+    </div>
+  `).join("");
+}
+
+function setStatus(i, text, kind=""){
+  const s = el(`status${i}`);
+  if(!s) return;
+  const normalized = String(text || "OFFLINE").toUpperCase();
+  const temporary = normalized === "LOGIN…" || normalized === "LOGIN...";
+  const status = ["ONLINE","OFFLINE","ERROR","SUSPEND"].includes(normalized) ? normalized : (temporary ? normalized : "ERROR");
+  accounts[i].status = status;
+  const label = status === "LOGIN…" || status === "LOGIN..." ? "LOGIN" : status;
+  s.textContent = "";
+  s.title = label;
+  s.setAttribute("aria-label", `Status Troop ${i+1}: ${label}`);
+  s.className = "troop-status";
+  if(status === "ONLINE") s.classList.add("online");
+  else if(status === "SUSPEND") s.classList.add("suspend");
+  else if(status === "ERROR") s.classList.add("error");
+  else if(status === "OFFLINE") s.classList.add("offline");
+  else if(temporary) s.classList.add("login");
+}
+
+
+function setBalance(i, label){
+  let value = String(label ?? "").trim();
+  const numeric = value.replace(/[^0-9.,-]/g, "").trim();
+  accounts[i].balance = numeric || "-";
+  const b = el(`b${i}`);
+  if(b) { const v = b.querySelector("strong"); if(v) v.textContent = accounts[i].balance; else b.textContent = accounts[i].balance; }
+}
+
+function validRange(){
+  const rawStart = el("rangeStart").value.trim();
+  const rawEnd = el("rangeEnd").value.trim();
+  if(rawStart === "") return null;
+  const start = Number(rawStart);
+  if(!Number.isSafeInteger(start) || start < 0) return null;
+  let end = rawEnd === "" ? start + 9 : Number(rawEnd);
+  if(!Number.isSafeInteger(end)) return null;
+  const step = end >= start ? 1 : -1;
+  end = start + step * 9;
+  return {start, end, step};
+}
+
+function generateTroop(){
+  sync();
+  const main = el("mainTroop").value.trim();
+  if(!main){ return; }
+  const range = validRange();
+  if(!range){ return; }
+  el("rangeEnd").value = String(range.end);
+  for(let i=0; i<10; i++){
+    accounts[i].username = main + String(range.start + i * range.step);
+  }
+  renderAccounts();
+}
+
+function generatePassword(){
+  sync();
+  const p = el("mainPassword").value;
+  if(!p){ return; }
+  for(let i=0; i<10; i++){
+    accounts[i].password = p;
+  }
+  renderAccounts();
+}
+
+function clearFields(){
+  for(let i=0; i<10; i++){
+    accounts[i].username = "";
+    accounts[i].password = "";
+    accounts[i].balance = "-";
+  }
+  el("mainTroop").value = "";
+  el("mainPassword").value = "";
+  renderAccounts();
+}
+
+let apiDisplayIndex = null;
+function openEvents(i){
+  const a = accounts[i];
+  if(!a.sessionId) return;
+  // Tampilkan event dari satu WebSocket saja agar log tidak terduplikasi.
+  if(apiDisplayIndex !== null && apiDisplayIndex !== i){
+    return;
+  }
+  apiDisplayIndex = i;
+  if(a.eventSource) try{ a.eventSource.close(); }catch{}
+  const es = new EventSource(`/api/events?sessionId=${encodeURIComponent(a.sessionId)}`);
+  a.eventSource = es;
+  es.onmessage = e => {
+    try{
+      const wrapper = JSON.parse(e.data);
+      const msg = wrapper?.event ?? wrapper;
+      handleApiEvent(i, msg);
+    }catch(err){
+      return;
+    }
+  };
+  es.onerror = () => {
+    // SSE can close independently from the authenticated WebSocket. Do not
+    // mark the account offline merely because the browser event stream failed.
+  };
+}
+
+const TIMER_START_MS = 60000;
+let timerValue = TIMER_START_MS;
+let timerRunning = false;
+let timerDeadline = 0;
+let timerFrame = 0;
+let timerGeneration = 0;
+let kickTriggeredForTimer = false;
+let lastTimerEventKey = "";
+let activeVoteKey = "";
+
+function renderTimer(){
+  const node = el("timerValue");
+  if(node) node.textContent = String(Math.max(0, Math.ceil(timerValue)));
+}
+
+function getKickTimerMs(){
+  return Math.max(0, Number(el("kickTimer")?.value) || 0);
+}
+
+function resetTimer(){
+  timerGeneration++;
+  timerRunning = false;
+  if(timerFrame) clearTimeout(timerFrame);
+  timerFrame = 0;
+  timerDeadline = 0;
+  timerValue = TIMER_START_MS;
+  kickTriggeredForTimer = false;
+  renderTimer();
+}
+
+function triggerKickAllIfReached(previousValue = null){
+  const configuredMs = getKickTimerMs();
+  if(kickTriggeredForTimer || configuredMs < 0) return;
+
+  // Jangan bergantung pada exact millisecond tick. Trigger saat countdown
+  // melewati nilai textbox, sehingga 1500 ms tidak akan terlewat akibat
+  // setTimeout/performance jitter.
+  const reached = previousValue === null
+    ? timerValue <= configuredMs
+    : previousValue > configuredMs && timerValue <= configuredMs;
+
+  if(reached){
+    kickTriggeredForTimer = true;
+    const button = el("kickAllButton");
+    if(button) button.click();
+    else kickSelectedTargets();
+  }
+}
+
+function startCountdown(durationMs = TIMER_START_MS, eventKey = ""){
+  // Event yang sama/duplikat tidak boleh menghidupkan ulang timer.
+  if(eventKey && eventKey === lastTimerEventKey){
+    return;
+  }
+  if(eventKey) lastTimerEventKey = eventKey;
+
+  const duration = Math.max(0, Number(durationMs) || 0);
+  const generation = ++timerGeneration;
+
+  if(timerFrame) clearTimeout(timerFrame);
+
+  timerValue = duration;
+  timerDeadline = performance.now() + duration;
+  timerRunning = duration > 0;
+  kickTriggeredForTimer = false;
+  renderTimer();
+  triggerKickAllIfReached(null);
+
+  if(!timerRunning){
+    timerValue = 0;
+    renderTimer();
+    return;
+  }
+
+  // Asynchronous countdown. Tidak ada interval blocking dan timer tidak
+  // pernah di-reset ke 60000 saat mencapai 0.

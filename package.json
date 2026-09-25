@@ -4,15 +4,7 @@
   "private": true,
   "description": "MIG Duel Kick 10 using the official MigReborn Developer WebSocket API",
   "main": "server.js",
-  "scripts": {
-    "start": "node server.js",
-    "check": "node --check server.js && node --check public/frontend.js"
-  },
-  "engines": {
-    "node": ">=18"
-  },
-  "dependencies": {
-    "express": "^4.21.2",
-    "ws": "^8.18.0"
-  }
+  "scripts": { "start": "node server.js" },
+  "engines": { "node": ">=18" },
+  "dependencies": { "express": "^4.21.2", "ws": "^8.18.0" }
 }

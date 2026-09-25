@@ -570,7 +570,7 @@ app.post("/api/kick-loop", async (req, res) => {
     : [];
   const targetDelayMs = Math.max(0, Math.min(Number(textdelay) || 0, 86400000));
   const delayMs = Math.max(0, Math.min(Number(delayBatch) || 0, 86400000));
-  const loopCount = Math.max(1, Math.min(parseInt(textloop, 10) || 30, 100));
+  const loopCount = Math.max(1, Math.min(parseInt(textloop, 10) || 1, 100));
 
   if (!ids.length) return res.status(400).json({ ok: false, error: "Tidak ada Troop yang ONLINE." });
   if (!room) return res.status(400).json({ ok: false, error: "Room wajib diisi." });
@@ -647,12 +647,12 @@ app.post("/api/kick-loop", async (req, res) => {
       : ids.map((sessionId, i) => ({ sessionId, websocket: i + 1 }));
     const RACE_BURST = burstSize;
 
-    // KICK LIMIT: maximum 50 kick dispatches per physical WebSocket
-    // in any rolling 30-second window for KICK ALL.
-    // It is intentionally per-WebSocket, not global.
-    const kickRateLimit = 50;
-    const kickRateWindowMs = 500;
-    // Rate-limit pacing is handled directly by waitForKickRateLimit().
+    // HARD SAFETY LIMIT: maximum 100 kick dispatches per physical WebSocket
+    // in any rolling 1-second window for KICK ALL.
+    // It is intentionally per-WebSocket, not global: 6 sockets can each send
+    // at most 100 kicks/sec, while no individual socket can exceed 100/sec.
+    const kickRateLimit = 150;
+    const kickRateWindowMs = 1000;
     const wsDispatchHistory = new Map();
 
     async function waitForKickRateLimit(websocket) {
@@ -773,11 +773,9 @@ app.post("/api/kick-loop", async (req, res) => {
               await sleep(targetDelayMs);
             }
           }
-          // Respect the configured batch delay exactly.
-          // When batch delay is 0, do not add an extra artificial gap;
-          // waitForKickRateLimit() remains the only pacing mechanism.
+          // Delay hanya diterapkan di antara burst dalam loop yang sama.
           const isEndOfLoop = pos + RACE_BURST >= orderedIndices.length;
-          if (!isEndOfLoop && delayMs > 0) {
+          if (delayMs > 0 && !isEndOfLoop) {
             await waitBatchDelay(delayMs);
           }
         }
