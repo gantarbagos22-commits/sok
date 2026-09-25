@@ -29,6 +29,7 @@ const balanceWaiters = new Map();
 const messageWaiters = new Map();
 const participantWaiters = new Map();
 const joinWaiters = new Map();
+const leaveWaiters = new Map();
 
 function makeId() { return crypto.randomBytes(16).toString("hex"); }
 function safeError(err) { return String(err?.message || err || "Unknown error"); }
@@ -94,6 +95,24 @@ function closeSession(sessionId, reason = "logout") {
     }
     joinWaiters.delete(sessionId);
   }
+
+  const lw = leaveWaiters.get(sessionId);
+  if (lw) {
+    for (const entry of lw) {
+      clearTimeout(entry.timer);
+      entry.reject(new Error("Session ditutup sebelum hasil Leave Room diterima."));
+    }
+    leaveWaiters.delete(sessionId);
+  }
+
+  const mw = messageWaiters.get(sessionId);
+  if (mw) {
+    for (const entry of mw) {
+      clearTimeout(entry.timer);
+      entry.reject(new Error("Session ditutup sebelum respons pesan diterima."));
+    }
+    messageWaiters.delete(sessionId);
+  }
   return true;
 }
 
@@ -146,6 +165,7 @@ function connectAccount(username, password, socketIndex = null) {
       resolveMessageResult(sessionId, msg);
       resolveParticipants(sessionId, msg);
       resolveJoin(sessionId, msg);
+      resolveLeave(sessionId, msg);
 
       // Forward the raw API event. Socket 1 is explicitly tagged here so
       // the frontend never has to guess which authenticated WebSocket sent it.
@@ -243,22 +263,27 @@ function send(sessionId, payload) {
   account.socket.send(JSON.stringify(payload));
 }
 
-function waitForJoin(sessionId, room, timeoutMs = 10000) {
+function normalizeRoomName(value) {
+  return String(value ?? "").trim().toLowerCase();
+}
+
+function isSuccessfulDirectResult(msg) {
+  const data = msg?.data || {};
+  const status = String(data.status ?? msg?.status ?? "").trim().toLowerCase();
+  const { code } = extractApiError(msg);
+  if (code) return false;
+  return !["error", "failed", "failure", "denied", "rejected", "forbidden"].includes(status);
+}
+
+function waitForJoin(sessionId, room, timeoutMs = 8000) {
   return new Promise((resolve, reject) => {
-    const entry = {
-      room: String(room || "").trim(),
-      resolve,
-      reject,
-      timer: null
-    };
+    const entry = { room: normalizeRoomName(room), resolve, reject, timer: null };
     entry.timer = setTimeout(() => {
       const list = joinWaiters.get(sessionId) || [];
       const next = list.filter(x => x !== entry);
-      if (next.length) joinWaiters.set(sessionId, next);
-      else joinWaiters.delete(sessionId);
-      reject(new Error(`Timeout menunggu hasil Enter Room untuk room "${entry.room}".`));
+      if (next.length) joinWaiters.set(sessionId, next); else joinWaiters.delete(sessionId);
+      reject(new Error(`Timeout menunggu hasil Enter Room untuk room "${room}".`));
     }, timeoutMs);
-
     const list = joinWaiters.get(sessionId) || [];
     list.push(entry);
     joinWaiters.set(sessionId, list);
@@ -266,42 +291,69 @@ function waitForJoin(sessionId, room, timeoutMs = 10000) {
 }
 
 function resolveJoin(sessionId, msg) {
-  const type = String(msg?.type || "").trim().toLowerCase();
-  const isJoinResult = type === "room.join.result";
-  if (!isJoinResult) return false;
-
+  if (String(msg?.type || "").toLowerCase() !== "room.join.result") return false;
   const list = joinWaiters.get(sessionId);
   if (!list?.length) return false;
 
-  const room = String(msg?.data?.room ?? msg?.room ?? "").trim();
+  const room = normalizeRoomName(msg.data?.room ?? msg.room ?? "");
   let index = room ? list.findIndex(x => x.room === room) : 0;
-  if (index < 0) index = 0;
-
+  if (index < 0) return false;
   const entry = list[index];
   if (!entry) return false;
 
   clearTimeout(entry.timer);
   list.splice(index, 1);
-  if (list.length) joinWaiters.set(sessionId, list);
-  else joinWaiters.delete(sessionId);
+  if (list.length) joinWaiters.set(sessionId, list); else joinWaiters.delete(sessionId);
 
-  // The Developer API uses room.join.result for both successful and failed
-  // direct join commands. Treat explicit failure fields as failure instead of
-  // assuming that the absence of an error code means success.
-  const apiErr = extractApiError(msg);
-  const data = msg?.data || {};
-  const status = String(data?.status ?? msg?.status ?? "").trim().toLowerCase();
-  const successField = data?.success ?? msg?.success;
-  const failed = Boolean(apiErr.code) || successField === false ||
-    /^(error|failed|failure|denied|rejected|forbidden|unauthorized)$/i.test(status);
-
-  if (!failed) {
+  if (isSuccessfulDirectResult(msg)) {
     const account = sessions.get(sessionId);
-    if (account && room) account.joinedRoom = room;
+    const joinedRoom = String(msg.data?.room ?? msg.room ?? entry.room).trim();
+    if (account) account.joinedRoom = joinedRoom;
     entry.resolve(msg);
   } else {
-    const message = apiErr.code || apiErr.message || `Enter Room gagal${status ? ` (${status})` : ""}.`;
-    const err = new Error(message);
+    const apiErr = extractApiError(msg);
+    const err = new Error(apiErr.message || `Enter Room gagal${apiErr.code ? ` (${apiErr.code})` : ""}.`);
+    err.code = apiErr.code;
+    err.event = msg;
+    entry.reject(err);
+  }
+  return true;
+}
+
+function waitForLeave(sessionId, room, timeoutMs = 8000) {
+  return new Promise((resolve, reject) => {
+    const entry = { room: normalizeRoomName(room), resolve, reject, timer: null };
+    entry.timer = setTimeout(() => {
+      const list = leaveWaiters.get(sessionId) || [];
+      const next = list.filter(x => x !== entry);
+      if (next.length) leaveWaiters.set(sessionId, next); else leaveWaiters.delete(sessionId);
+      reject(new Error(`Timeout menunggu hasil Leave Room untuk room "${room}".`));
+    }, timeoutMs);
+    const list = leaveWaiters.get(sessionId) || [];
+    list.push(entry);
+    leaveWaiters.set(sessionId, list);
+  });
+}
+
+function resolveLeave(sessionId, msg) {
+  if (String(msg?.type || "").toLowerCase() !== "room.leave.result") return false;
+  const list = leaveWaiters.get(sessionId);
+  if (!list?.length) return false;
+  const room = normalizeRoomName(msg.data?.room ?? msg.room ?? "");
+  let index = room ? list.findIndex(x => x.room === room) : 0;
+  if (index < 0) return false;
+  const entry = list[index];
+  if (!entry) return false;
+  clearTimeout(entry.timer);
+  list.splice(index, 1);
+  if (list.length) leaveWaiters.set(sessionId, list); else leaveWaiters.delete(sessionId);
+  if (isSuccessfulDirectResult(msg)) {
+    const account = sessions.get(sessionId);
+    if (account && normalizeRoomName(account.joinedRoom) === entry.room) account.joinedRoom = null;
+    entry.resolve(msg);
+  } else {
+    const apiErr = extractApiError(msg);
+    const err = new Error(apiErr.message || `Leave Room gagal${apiErr.code ? ` (${apiErr.code})` : ""}.`);
     err.code = apiErr.code;
     err.event = msg;
     entry.reject(err);
@@ -549,25 +601,26 @@ app.post("/api/action", async (req, res) => {
   try {
     if (action === "join") {
       if (!room) throw new Error("Room wajib diisi.");
-      const waiter = waitForJoin(sessionId, room, 10000);
+      const waiter = waitForJoin(sessionId, room);
       try {
         send(sessionId, { type: "room.join", room });
         const event = await waiter;
         return res.json({ ok: true, sent: action, event });
       } catch (e) {
-        const pending = joinWaiters.get(sessionId) || [];
-        for (const item of pending) {
-          if (item.timer) clearTimeout(item.timer);
-        }
-        joinWaiters.delete(sessionId);
-        return res.status(400).json({
-          ok: false,
-          error: safeError(e),
-          event: e?.event || null
-        });
+        return res.status(400).json({ ok: false, error: safeError(e), event: e?.event || null });
       }
     }
-    else if (action === "leave") { if (!room) throw new Error("Room wajib diisi."); send(sessionId, { type: "room.leave", room }); }
+    else if (action === "leave") {
+      if (!room) throw new Error("Room wajib diisi.");
+      const waiter = waitForLeave(sessionId, room);
+      try {
+        send(sessionId, { type: "room.leave", room });
+        const event = await waiter;
+        return res.json({ ok: true, sent: action, event });
+      } catch (e) {
+        return res.status(400).json({ ok: false, error: safeError(e), event: e?.event || null });
+      }
+    }
     else if (action === "participants") {
       if (!room) throw new Error("Room wajib diisi.");
       const waiter = waitForParticipants(sessionId, room, 10000);
@@ -624,39 +677,55 @@ app.post("/api/batch-action", async (req, res) => {
 
   if (action === "join") {
     if (!room) return res.status(400).json({ ok: false, error: "Room wajib diisi." });
-
-    // Join is a direct WebSocket command. Dispatch to every selected socket
-    // immediately and independently; one slow/unresponsive socket must never
-    // block the other sockets from receiving room.join. We still register a
-    // waiter before each send so the direct room.join.result cannot be missed.
     const jobs = ids.map(async (sessionId) => {
       try {
-        const waiter = waitForJoin(sessionId, room, 5000);
+        const waiter = waitForJoin(sessionId, room);
         send(sessionId, { type: "room.join", room });
         const event = await waiter;
-        return { sessionId, ok: true, sent: true, event };
+        return { sessionId, ok: true, event };
       } catch (e) {
-        return { sessionId, ok: false, sent: false, error: safeError(e), event: e?.event || null };
+        return { sessionId, ok: false, error: safeError(e), event: e?.event || null };
       }
     });
-
     const results = await Promise.all(jobs);
     const success = results.filter(x => x.ok).length;
-    return res.json({
-      ok: success > 0,
-      action,
-      room: String(room).trim(),
-      sent: results.filter(x => x.sent).length,
-      success,
-      total: results.length,
-      results
-    });
+    return res.json({ ok: success === results.length && results.length > 0, action, room, sent: ids.length, success, total: results.length, results });
+  }
+
+  if (action === "leave") {
+    if (!room) return res.status(400).json({ ok: false, error: "Room wajib diisi." });
+    const results = await Promise.all(ids.map(async (sessionId) => {
+      try {
+        const waiter = waitForLeave(sessionId, room);
+        send(sessionId, { type: "room.leave", room });
+        const event = await waiter;
+        return { sessionId, ok: true, event };
+      } catch (e) {
+        return { sessionId, ok: false, error: safeError(e), event: e?.event || null };
+      }
+    }));
+    const success = results.filter(x => x.ok).length;
+    return res.json({ ok: success > 0, action, room, sent: ids.length, success, total: results.length, results });
+  }
+
+  if (action === "participants") {
+    if (!room) return res.status(400).json({ ok: false, error: "Room wajib diisi." });
+    const results = await Promise.all(ids.map(async (sessionId) => {
+      try {
+        const waiter = waitForParticipants(sessionId, room);
+        send(sessionId, { type: "room.participants", room });
+        const event = await waiter;
+        return { sessionId, ok: true, event };
+      } catch (e) {
+        return { sessionId, ok: false, error: safeError(e), event: e?.event || null };
+      }
+    }));
+    const success = results.filter(x => x.ok).length;
+    return res.json({ ok: success > 0, action, room, sent: ids.length, success, total: results.length, results });
   }
 
   let payload;
-  if (action === "leave") { if (!room) return res.status(400).json({ ok: false, error: "Room wajib diisi." }); payload = { type: "room.leave", room }; }
-  else if (action === "participants") { if (!room) return res.status(400).json({ ok: false, error: "Room wajib diisi." }); payload = { type: "room.participants", room }; }
-  else if (action === "balance") payload = { type: "wallet.balance" };
+  if (action === "balance") payload = { type: "wallet.balance" };
   else if (action === "kick") { if (!room || !targetUsername) return res.status(400).json({ ok: false, error: "Room dan target wajib diisi." }); payload = { type: "room.kick", room, target_username: targetUsername }; }
   else if (action === "message") { if (!room || !message) return res.status(400).json({ ok: false, error: "Room dan pesan wajib diisi." }); payload = { type: "room.send_message", room, message }; }
   else return res.status(400).json({ ok: false, error: "Action tidak dikenal." });
@@ -1022,11 +1091,11 @@ app.post("/api/logout", (req, res) => {
 });
 
 // ONE logout command for all active sessions.
-app.post("/api/logout-batch", (req, res) => {
-  const ids = Array.isArray(req.body?.sessionIds) ? [...new Set(req.body.sessionIds.map(String))].slice(0, 10) : getActiveSessionIds();
+app.post("/api/logout-batch", (_req, res) => {
+  const ids = getActiveSessionIds();
   let closed = 0;
   for (const id of ids) if (closeSession(id, "logout all")) closed++;
-  res.json({ ok: true, closed });
+  res.json({ ok: true, closed, remaining: sessions.size });
 });
 
 app.get("*", (_req, res) => res.sendFile(path.join(__dirname, "public", "index.html")));
